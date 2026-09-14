@@ -1,0 +1,23 @@
+# Remote state. Worth setting up if you will run terraform from more than one
+# machine, which is the point of keeping this repository. Terraform 1.10 and
+# later lock through S3 itself, so there is no DynamoDB table to create.
+#
+# Create the bucket once, then copy this file to backend.tf and run
+# `terraform init -migrate-state`.
+#
+#   aws s3api create-bucket --bucket YOUR-BUCKET --region us-east-1
+#   aws s3api put-bucket-versioning --bucket YOUR-BUCKET \
+#       --versioning-configuration Status=Enabled
+#   aws s3api put-public-access-block --bucket YOUR-BUCKET \
+#       --public-access-block-configuration \
+#       BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+terraform {
+  backend "s3" {
+    bucket       = "YOUR-BUCKET"
+    key          = "winvm/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}

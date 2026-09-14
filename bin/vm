@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# Start, stop and reach the Windows development VM.
+#
+# The instance is located by its Name tag rather than by Terraform state, so
+# this works on any machine that has the AWS CLI and credentials, with no
+# checkout and no terraform installed.
+#
+#   VM_NAME    Name tag of the instance   (default: winvm)
+#   AWS_REGION Region to look in          (default: us-east-1)
+#   VM_USER    SSH user                   (default: Administrator)
+#   VM_KEY     SSH private key            (default: ~/.ssh/id_ed25519)
+
+set -euo pipefail
+
+VM_NAME="${VM_NAME:-winvm}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+VM_USER="${VM_USER:-Administrator}"
+VM_KEY="${VM_KEY:-$HOME/.ssh/id_ed25519}"
+
+DYNAMIC_RULE_DESC="vm-cli-dynamic"
+
+aws_() { aws --region "$AWS_REGION" "$@"; }
+
+die() { printf 'vm: %s\n' "$*" >&2; exit 1; }
+
+instance_id() {
+  local id
+  id=$(aws_ ec2 describe-instances \
+    --filters "Name=tag:Name,Values=$VM_NAME" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text)
+  [ -n "$id" ] && [ "$id" != "None" ] || die "no instance tagged Name=$VM_NAME in $AWS_REGION"
+  # Two live instances with the same Name tag means the caller is pointed at
+  # the wrong account or a rebuild went sideways. Guessing would be worse.
+  [ "$(printf '%s\n' $id | wc -w)" -eq 1 ] || die "multiple instances tagged Name=$VM_NAME: $id"
+  printf '%s' "$id"
+}
+
+instance_field() {
+  aws_ ec2 describe-instances --instance-ids "$(instance_id)" \
+    --query "Reservations[0].Instances[0].$1" --output text
+}
+
+security_group_id() {
+  aws_ ec2 describe-instances --instance-ids "$(instance_id)" \
+    --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text
+}
+
+public_ip() {
+  local ip
+  ip=$(instance_field PublicIpAddress)
+  [ -n "$ip" ] && [ "$ip" != "None" ] || die "instance has no public address; is it running? try: vm up"
+  printf '%s' "$ip"
+}
+
+wait_running() {
+  local id="$1"
+  printf 'waiting for %s to reach running... ' "$id" >&2
+  aws_ ec2 wait instance-running --instance-ids "$id"
+  printf 'ok\n' >&2
+}
+
+wait_ssh() {
+  local ip="$1" deadline=$((SECONDS + 300))
+  printf 'waiting for sshd on %s... ' "$ip" >&2
+  while [ $SECONDS -lt $deadline ]; do
+    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+           -o BatchMode=yes -i "$VM_KEY" "$VM_USER@$ip" exit 2>/dev/null; then
+      printf 'ok\n' >&2
+      return 0
+    fi
+    sleep 5
+  done
+  printf 'timed out\n' >&2
+  die "sshd did not answer within 5 minutes; check 'vm allow-ip' and 'vm logs'"
+}
+
+cmd_up() {
+  local id; id=$(instance_id)
+  local state; state=$(instance_field State.Name)
+  case "$state" in
+    running) printf 'already running\n' >&2 ;;
+    *) aws_ ec2 start-instances --instance-ids "$id" >/dev/null; wait_running "$id" ;;
+  esac
+  printf '%s\n' "$(public_ip)"
+}
+
+cmd_down() {
+  local id; id=$(instance_id)
+  aws_ ec2 stop-instances --instance-ids "$id" >/dev/null
+  printf 'stopping %s\n' "$id" >&2
+  aws_ ec2 wait instance-stopped --instance-ids "$id"
+  printf 'stopped\n' >&2
+}
+
+cmd_status() {
+  local id; id=$(instance_id)
+  printf 'instance   %s\n' "$id"
+  printf 'state      %s\n' "$(instance_field State.Name)"
+  printf 'type       %s\n' "$(instance_field InstanceType)"
+  printf 'address    %s\n' "$(instance_field PublicIpAddress)"
+  printf 'launched   %s\n' "$(instance_field LaunchTime)"
+
+  local status
+  status=$(aws_ ssm get-parameter --name "/$VM_NAME/bootstrap-status" \
+    --query 'Parameter.Value' --output text 2>/dev/null || true)
+  printf 'bootstrap  %s\n' "${status:-unknown}"
+
+  printf 'allowed    %s\n' "$(aws_ ec2 describe-security-group-rules \
+    --filters "Name=group-id,Values=$(security_group_id)" \
+    --query 'SecurityGroupRules[?!IsEgress].CidrIpv4' --output text | tr '\t' ' ')"
+}
+
+cmd_ip() { public_ip; printf '\n'; }
+
+cmd_ssh() {
+  local state; state=$(instance_field State.Name)
+  if [ "$state" != "running" ]; then
+    printf 'instance is %s, starting it\n' "$state" >&2
+    cmd_up >/dev/null
+  fi
+  local ip; ip=$(public_ip)
+  exec ssh -o StrictHostKeyChecking=accept-new -i "$VM_KEY" "$VM_USER@$ip" "$@"
+}
+
+cmd_allow_ip() {
+  local sg; sg=$(security_group_id)
+  local ip; ip=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
+  [ -n "$ip" ] || die "could not determine your public address"
+
+  # Drop whatever this command authorised last time before adding the new one,
+  # so moving between networks does not accumulate stale openings.
+  local stale
+  stale=$(aws_ ec2 describe-security-group-rules \
+    --filters "Name=group-id,Values=$sg" \
+    --query "SecurityGroupRules[?Description=='$DYNAMIC_RULE_DESC'].SecurityGroupRuleId" \
+    --output text)
+  if [ -n "$stale" ] && [ "$stale" != "None" ]; then
+    aws_ ec2 revoke-security-group-ingress --group-id "$sg" \
+      --security-group-rule-ids $stale >/dev/null
+    printf 'revoked %d stale rule(s)\n' "$(printf '%s\n' $stale | wc -w)" >&2
+  fi
+
+  aws_ ec2 authorize-security-group-ingress --group-id "$sg" \
+    --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$ip/32,Description=$DYNAMIC_RULE_DESC}]" \
+    >/dev/null
+  printf 'authorised %s/32 for SSH\n' "$ip" >&2
+}
+
+cmd_password() {
+  aws_ ssm get-parameter --name "/$VM_NAME/administrator-password" \
+    --with-decryption --query 'Parameter.Value' --output text
+}
+
+cmd_console() {
+  # Works without port 22 and without an allow-listed source address, which
+  # makes it the way back in after locking yourself out.
+  exec aws_ ssm start-session --target "$(instance_id)"
+}
+
+cmd_logs() {
+  local id; id=$(instance_id)
+  local cmd_id
+  cmd_id=$(aws_ ssm send-command --instance-ids "$id" \
+    --document-name AWS-RunPowerShellScript \
+    --parameters 'commands=["Get-Content C:\\ProgramData\\winvm\\bootstrap.log -Tail 120"]' \
+    --query 'Command.CommandId' --output text)
+  aws_ ssm wait command-executed --command-id "$cmd_id" --instance-id "$id" 2>/dev/null || true
+  aws_ ssm get-command-invocation --command-id "$cmd_id" --instance-id "$id" \
+    --query 'StandardOutputContent' --output text
+}
+
+usage() {
+  cat <<'USAGE'
+usage: vm <command>
+
+  up          start the instance and print its address
+  down        stop the instance
+  status      state, address, bootstrap progress, allowed source ranges
+  ssh [cmd]   ssh in, starting the instance first if it is stopped
+  ip          print the public address
+  allow-ip    authorise your current public address for SSH
+  password    print the Administrator password (for RDP)
+  console     Session Manager shell, independent of SSH and of your address
+  logs        tail the first-boot bootstrap log
+
+environment: VM_NAME, AWS_REGION, VM_USER, VM_KEY
+USAGE
+}
+
+case "${1:-}" in
+  up|start)   shift; cmd_up "$@" ;;
+  down|stop)  shift; cmd_down "$@" ;;
+  status)     shift; cmd_status "$@" ;;
+  ssh)        shift; cmd_ssh "$@" ;;
+  ip)         shift; cmd_ip "$@" ;;
+  allow-ip)   shift; cmd_allow_ip "$@" ;;
+  password)   shift; cmd_password "$@" ;;
+  console)    shift; cmd_console "$@" ;;
+  logs)       shift; cmd_logs "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

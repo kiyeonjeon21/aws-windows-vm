@@ -1,0 +1,217 @@
+<powershell>
+# Rendered by terraform/instance.tf. Runs once, as SYSTEM, at first boot.
+#
+# Two rules apply when editing this file:
+#   1. Terraform expands its own $${...} and %%{...} sequences before the script
+#      ever reaches the instance. Never write a PowerShell $${var} brace
+#      reference here, and never use the %%{ ForEach-Object alias. Escape a
+#      literal one by doubling the sigil, as this comment does.
+#   2. Everything SSH depends on happens before anything that reaches the
+#      network for packages, so a failed download can never cost you the way in.
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$Root = 'C:\ProgramData\winvm'
+New-Item -ItemType Directory -Force -Path $Root | Out-Null
+Start-Transcript -Path "$Root\bootstrap.log" -Append -Force
+
+$Region    = '${region}'
+$SsmPrefix = '${ssm_prefix}'
+$Aws       = 'C:\Program Files\Amazon\AWSCLIV2\aws.exe'
+$Choco     = 'C:\ProgramData\chocolatey\bin\choco.exe'
+
+function Publish-Status($Value) {
+    try {
+        & $Aws ssm put-parameter --name "$SsmPrefix/bootstrap-status" --type String `
+            --value $Value --overwrite --region $Region 2>&1 | Out-Null
+    } catch {
+        Write-Host "could not publish status '$Value': $_"
+    }
+}
+
+# Each step is isolated. A step that fails is logged and the rest still run,
+# because a missing package is an inconvenience while a half-configured sshd is
+# a locked door.
+function Invoke-Step($Name, [scriptblock]$Body) {
+    Write-Host ""
+    Write-Host "=== $Name ==="
+    Publish-Status "running:$Name"
+    try {
+        & $Body
+        Write-Host "--- $Name ok"
+    } catch {
+        Write-Host "--- $Name FAILED: $_"
+        $script:Failed += $Name
+    }
+}
+
+$script:Failed = @()
+
+# --------------------------------------------------------------------------
+Invoke-Step 'openssh-server' {
+    $cap = Get-WindowsCapability -Online |
+        Where-Object { $_.Name -like 'OpenSSH.Server*' } |
+        Select-Object -First 1
+
+    if ($cap -and $cap.State -ne 'Installed') {
+        Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+    }
+
+    Set-Service -Name sshd -StartupType Automatic
+    Start-Service -Name sshd
+
+    if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
+            -DisplayName 'OpenSSH Server (sshd)' -Enabled True `
+            -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+    }
+}
+
+# --------------------------------------------------------------------------
+Invoke-Step 'authorized-keys' {
+    # Any account in the Administrators group authenticates against this one
+    # shared file, not against a per-user ~/.ssh/authorized_keys. sshd also
+    # refuses the file outright unless only SYSTEM and Administrators can write
+    # it, which is what the icacls line enforces. Both are easy to get wrong and
+    # both fail closed with an unhelpful "Permission denied".
+    $ak = 'C:\ProgramData\ssh\administrators_authorized_keys'
+    New-Item -ItemType Directory -Force -Path (Split-Path $ak) | Out-Null
+    Set-Content -Path $ak -Value '${ssh_public_key}' -Encoding ascii -Force
+
+    icacls.exe $ak /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
+    Restart-Service -Name sshd
+}
+
+# --------------------------------------------------------------------------
+Invoke-Step 'administrator-password' {
+    # Generated on the box and filed in Parameter Store, so it never appears in
+    # Terraform state. SSH does not need it; RDP and `runas` do.
+    $set = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-_=+.'
+    $buf = New-Object 'byte[]' 40
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($buf)
+    $pw = 'Aa9-' + (-join ($buf | ForEach-Object { $set[$_ % $set.Length] }))
+
+    net.exe user Administrator $pw | Out-Null
+    & $Aws ssm put-parameter --name "$SsmPrefix/administrator-password" `
+        --type SecureString --value $pw --overwrite --region $Region 2>&1 | Out-Null
+}
+
+# --------------------------------------------------------------------------
+Invoke-Step 'idle-shutdown-watchdog' {
+    $limit = [int]'${idle_shutdown_minutes}'
+    if ($limit -le 0) {
+        Write-Host 'idle shutdown disabled by configuration'
+        return
+    }
+
+    $watchdog = @'
+# Stops the instance after a stretch of no interactive use. Registered by
+# user-data; edit terraform.tfvars and rebuild rather than editing in place.
+$ErrorActionPreference = 'SilentlyContinue'
+
+$IdleLimit  = ${idle_shutdown_minutes}
+$CpuLimit   = ${idle_cpu_threshold}
+$IntervalMin = 5
+$StateFile  = 'C:\ProgramData\winvm\idle-minutes.txt'
+
+# Never pull the rug out from under first boot while packages are installing.
+$uptime = (Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+if ($uptime.TotalMinutes -lt 15) { exit }
+
+$ssh = @(Get-NetTCPConnection -LocalPort 22   -State Established).Count
+$rdp = @(Get-NetTCPConnection -LocalPort 3389 -State Established).Count
+# Session Manager rides an outbound connection, so it is invisible to the port
+# checks above and has to be counted by its worker process instead.
+$ssm = @(Get-Process -Name 'ssm-session-worker').Count
+$cpu = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
+
+if ($ssh -gt 0 -or $rdp -gt 0 -or $ssm -gt 0 -or $cpu -ge $CpuLimit) {
+    Set-Content -Path $StateFile -Value '0'
+    exit
+}
+
+$idle = 0
+if (Test-Path $StateFile) { $idle = [int](Get-Content $StateFile -Raw).Trim() }
+$idle += $IntervalMin
+Set-Content -Path $StateFile -Value "$idle"
+
+if ($idle -ge $IdleLimit) {
+    Set-Content -Path $StateFile -Value '0'
+    Stop-Computer -Force
+}
+'@
+
+    Set-Content -Path "$Root\idle-shutdown.ps1" -Value $watchdog -Encoding utf8 -Force
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Root\idle-shutdown.ps1`""
+
+    # An at-startup trigger carrying a repetition interval is the only shape
+    # that both survives a reboot and keeps firing every five minutes.
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+        -LogonType ServiceAccount -RunLevel Highest
+
+    Register-ScheduledTask -TaskName 'winvm-idle-shutdown' -Action $action `
+        -Trigger $trigger -Principal $principal -Force | Out-Null
+
+    Start-ScheduledTask -TaskName 'winvm-idle-shutdown'
+}
+
+# --------------------------------------------------------------------------
+Invoke-Step 'chocolatey' {
+    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+}
+
+Invoke-Step 'base-tooling' {
+    & $Choco install -y --no-progress --limit-output git powershell-core nodejs-lts gh
+}
+
+# --------------------------------------------------------------------------
+Invoke-Step 'default-shell' {
+    # Without this an SSH session lands in cmd.exe.
+    $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    if (-not (Test-Path $pwsh)) { throw "pwsh not found at $pwsh" }
+
+    New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
+        -Value $pwsh -PropertyType String -Force | Out-Null
+
+    # Without this, sshd keeps handing the shell a cmd.exe style /c and every
+    # non-interactive invocation breaks, scp and `ssh host <command>` included.
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShellCommandOption `
+        -Value '-c' -PropertyType String -Force | Out-Null
+}
+
+# --------------------------------------------------------------------------
+Invoke-Step 'run-setup-from-repo' {
+    $git = 'C:\Program Files\Git\cmd\git.exe'
+    $dir = 'C:\setup'
+
+    if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+    & $git clone --depth 1 --branch '${setup_ref}' '${setup_repo_url}' $dir
+    if ($LASTEXITCODE -ne 0) { throw "clone failed with exit code $LASTEXITCODE" }
+
+    & 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -ExecutionPolicy Bypass `
+        -File "$dir\bootstrap\setup.ps1"
+    if ($LASTEXITCODE -ne 0) { throw "setup.ps1 failed with exit code $LASTEXITCODE" }
+}
+
+# --------------------------------------------------------------------------
+if ($script:Failed.Count -eq 0) {
+    Publish-Status 'complete'
+    Write-Host 'bootstrap complete'
+} else {
+    $joined = $script:Failed -join ','
+    Publish-Status "complete-with-failures:$joined"
+    Write-Host "bootstrap finished with failed steps: $joined"
+}
+
+Stop-Transcript
+</powershell>
+<persist>false</persist>
