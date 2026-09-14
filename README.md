@@ -157,6 +157,33 @@ The instance generates it at first boot and writes it to `/winvm/administrator-p
 SSH does not use it. RDP does.
 RDP is closed by default; set `enable_rdp = true` if you need the desktop.
 
+## Windows Server 2025 traps worth knowing
+
+These each cost a debugging session when this was first built, and none of them announce themselves.
+
+**The OpenSSH firewall rule is scoped to the Private profile.**
+The AMI already ships an `OpenSSH-Server-In-TCP` rule, so the natural thing to write, create the rule when it is missing, silently does nothing.
+The rule that is already there applies only to the Private network profile, and an EC2 network adapter is classified Public.
+So sshd runs, listens on `0.0.0.0:22`, reports healthy, the rule exists and reports `Enabled: True`, and every packet is still dropped with nothing logged anywhere.
+The bootstrap now sets `-Profile Any` explicitly rather than trusting a rule it did not create.
+
+**The AWS CLI is not installed.**
+Older Windows AMIs shipped it at `C:\Program Files\Amazon\AWSCLIV2\aws.exe`.
+Server 2025 does not, so anything in user-data that shells out to `aws` fails.
+The bootstrap installs it from its MSI, after sshd is already serving.
+
+**The SSM agent may not register during first boot.**
+While user-data is busy the agent can take far longer than its usual minute or two to appear in `describe-instance-information`, which makes a slow boot look like a broken network.
+It registers normally once the box is idle.
+If you need to tell the two apart, launch a throwaway Linux instance into the same subnet with the same security group and instance profile: if that one registers, your networking and IAM are fine.
+
+**`Get-WindowsCapability -Online` with no `-Name` is a trap.**
+It enumerates the whole Feature-on-Demand catalogue against Windows Update, which is slow and can hang.
+Always ask for the capability you want by name.
+
+**Set `DefaultShellCommandOption` when you set `DefaultShell`.**
+Pointing sshd at PowerShell without it leaves sshd passing a cmd.exe style `/c`, which breaks `ssh host <command>` and scp while interactive logins keep working.
+
 ## Tearing it down
 
 ```sh
