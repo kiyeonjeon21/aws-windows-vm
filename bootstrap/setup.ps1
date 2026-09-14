@@ -139,7 +139,14 @@ Step 'machine-path' {
     }
 
     [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'Machine')
-    $env:Path = ($parts -join ';')
+
+    # Extend the process PATH, never replace it. The process PATH is the machine
+    # and user values already combined, and Chocolatey puts some packages on the
+    # user value only, Neovim among them. Assigning the machine value over the
+    # top drops those and every later step stops being able to find them.
+    foreach ($dir in $extra) {
+        if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$env:Path;$dir" }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -210,10 +217,16 @@ if (-not $SkipPackages) {
         # Pre-install so the first `nvim` is not a five minute download, and so
         # a broken plugin set surfaces here rather than the first time you open
         # a file over SSH.
-        $nvim = Get-Command nvim -ErrorAction SilentlyContinue
-        if (-not $nvim) { throw 'nvim not on PATH' }
+        # Chocolatey's neovim package installs here and registers it on the
+        # user PATH only, so do not assume PATH alone will find it.
+        $nvim = (Get-Command nvim -ErrorAction SilentlyContinue).Source
+        if (-not $nvim) {
+            $fallback = 'C:\tools\neovim\nvim-win64\bin\nvim.exe'
+            if (Test-Path $fallback) { $nvim = $fallback }
+        }
+        if (-not $nvim) { throw 'cannot locate nvim.exe' }
 
-        $proc = Start-Process $nvim.Source -PassThru -NoNewWindow `
+        $proc = Start-Process $nvim -PassThru -NoNewWindow `
             -ArgumentList '--headless', '+Lazy! sync', '+qa'
 
         if (-not $proc.WaitForExit(600000)) {
