@@ -184,7 +184,10 @@ Step 'git-defaults' {
     & $git config --system core.autocrlf input
     & $git config --system init.defaultBranch main
     & $git config --system pull.rebase true
-    & $git config --system --add safe.directory '*'
+    # --add appends a duplicate on every run. This script is meant to be safe
+    # to re-run, and after a handful of runs `git config --list` is mostly this
+    # one line repeated. --replace-all collapses it to a single entry.
+    & $git config --system --replace-all safe.directory '*'
 }
 
 # ---------------------------------------------------------------------------
@@ -230,24 +233,26 @@ if (-not $SkipPackages) {
         }
         if (-not $nvim) { throw 'cannot locate nvim.exe' }
 
-        function Invoke-Nvim([string[]] $NvimArgs, [int] $TimeoutMs) {
-            $proc = Start-Process $nvim -PassThru -NoNewWindow -ArgumentList $NvimArgs
-            if (-not $proc.WaitForExit($TimeoutMs)) {
-                $proc.Kill()
-                throw "nvim $($NvimArgs -join ' ') did not finish in time"
-            }
-        }
+        # Call nvim directly. Launching it through Start-Process -NoNewWindow
+        # looks equivalent and is not: nvim compiles treesitter parsers on
+        # libuv child processes, and started that way those never produce a
+        # parser. The run still prints "Language installed" for every language
+        # and leaves the parser directory empty, so the step passes while
+        # having done nothing. Measured: direct 24 parsers, Start-Process 0.
+        & $nvim --headless '+Lazy! sync' '+qa'
 
-        Invoke-Nvim @('--headless', '+Lazy! sync', '+qa') 600000
-
-        # Lazy's sync is synchronous, but nvim-treesitter compiles its parsers
-        # on background jobs that only start once the plugin loads, which
-        # happens on a filetype event. Quitting straight after the sync kills
-        # those jobs mid-build and leaves the parser directory empty, with
-        # nothing in the output to say so. Open a real file and let them run.
+        # Lazy's sync is synchronous, but nvim-treesitter only starts building
+        # parsers once the plugin loads, which happens on a filetype event.
+        # Quitting straight after the sync kills those jobs mid-build, so open
+        # a real file and give them time.
         $probe = Join-Path $env:TEMP 'lazyvim-warmup.lua'
-        Set-Content -Path $probe -Value 'return {}' -Encoding utf8
-        Invoke-Nvim @('--headless', $probe, '+sleep 150', '+qa') 600000
+        Set-Content -Path $probe -Value 'local warmup = 1' -Encoding utf8
+        & $nvim --headless $probe '+sleep 150' '+qa'
+
+        $parsers = @(Get-ChildItem (Join-Path $UserAppDataLocal 'nvim-data\site\parser') `
+            -Force -ErrorAction SilentlyContinue).Count
+        if ($parsers -eq 0) { throw 'plugin sync ran but produced no treesitter parsers' }
+        Write-Host "treesitter parsers installed: $parsers"
     }
 }
 
