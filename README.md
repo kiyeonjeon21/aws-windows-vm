@@ -116,6 +116,10 @@ That script is idempotent, so after pushing a change you can apply it without re
 cd C:\setup; git pull; pwsh -File .\bootstrap\setup.ps1
 ```
 
+Read the `git pull` output rather than assuming it worked.
+Neovim rewrites `config/nvim/lazy-lock.json` whenever plugins change, and git refuses to pull over a modified file, so a pull can abort while the setup run that follows quietly reapplies the old configuration.
+Commit the lock file from the box when the plugin versions are ones you want to keep, or `git checkout -- config/nvim/lazy-lock.json` to discard them.
+
 Editing `userdata.ps1.tftpl` is different.
 User-data only runs at first boot, so those changes take effect on the next rebuild and not before.
 
