@@ -61,6 +61,9 @@ $Packages = @(
 $NpmGlobals = @(
     '@anthropic-ai/claude-code'
     '@openai/codex'
+    # nvim-treesitter's main branch shells out to this to build parsers, and
+    # mason cannot reliably install it on Windows.
+    'tree-sitter-cli'
 )
 
 function Step {
