@@ -129,23 +129,34 @@ cmd_allow_ip() {
   local ip; ip=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
   [ -n "$ip" ] || die "could not determine your public address"
 
-  # Drop whatever this command authorised last time before adding the new one,
-  # so moving between networks does not accumulate stale openings.
+  # Authorise first and clean up afterwards. The other order has a window where
+  # the old rule is gone and the new one has not landed, and if the authorise
+  # then fails you have revoked your own way in from a machine that can no
+  # longer reach the box.
+  local out
+  if out=$(aws_ ec2 authorize-security-group-ingress --group-id "$sg" \
+      --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$ip/32,Description=$DYNAMIC_RULE_DESC}]" \
+      2>&1); then
+    printf 'authorised %s/32 for SSH\n' "$ip" >&2
+  elif printf '%s' "$out" | grep -q 'InvalidPermission.Duplicate'; then
+    # Already covered, usually by the allowed_cidrs rule Terraform manages.
+    # Your address has not changed, so there is nothing to do.
+    printf '%s/32 is already allowed for SSH\n' "$ip" >&2
+  else
+    die "$out"
+  fi
+
+  # Now retire anything this command opened for a network you have since left.
   local stale
   stale=$(aws_ ec2 describe-security-group-rules \
     --filters "Name=group-id,Values=$sg" \
-    --query "SecurityGroupRules[?Description=='$DYNAMIC_RULE_DESC'].SecurityGroupRuleId" \
+    --query "SecurityGroupRules[?Description=='$DYNAMIC_RULE_DESC' && CidrIpv4!='$ip/32'].SecurityGroupRuleId" \
     --output text)
   if [ -n "$stale" ] && [ "$stale" != "None" ]; then
     aws_ ec2 revoke-security-group-ingress --group-id "$sg" \
       --security-group-rule-ids $stale >/dev/null
-    printf 'revoked %d stale rule(s)\n' "$(printf '%s\n' $stale | wc -w)" >&2
+    printf 'revoked %d rule(s) for networks you have left\n' "$(printf '%s\n' $stale | wc -w)" >&2
   fi
-
-  aws_ ec2 authorize-security-group-ingress --group-id "$sg" \
-    --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$ip/32,Description=$DYNAMIC_RULE_DESC}]" \
-    >/dev/null
-  printf 'authorised %s/32 for SSH\n' "$ip" >&2
 }
 
 cmd_password() {
