@@ -15,7 +15,16 @@
 [CmdletBinding()]
 param(
     # Skip the Chocolatey packages when you only want the configuration steps.
-    [switch] $SkipPackages
+    [switch] $SkipPackages,
+
+    # The account whose per-user configuration this script writes: shell
+    # profile targets, Neovim config, npm global bin on PATH.
+    #
+    # EC2Launch v2 happens to run user-data as Administrator, so during first
+    # boot $env:APPDATA already points where we want. Relying on that is a trap
+    # waiting for the day it runs as SYSTEM instead and silently configures
+    # C:\Windows\system32\config\systemprofile. Name the account instead.
+    [string] $TargetUser = 'Administrator'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +33,13 @@ $ProgressPreference    = 'SilentlyContinue'
 $Choco     = 'C:\ProgramData\chocolatey\bin\choco.exe'
 $GitBash   = 'C:\Program Files\Git\bin\bash.exe'
 $Workspace = 'C:\work'
+
+$UserHome  = Join-Path 'C:\Users' $TargetUser
+$UserAppDataRoaming = Join-Path $UserHome 'AppData\Roaming'
+$UserAppDataLocal   = Join-Path $UserHome 'AppData\Local'
+
+# This repository, which is also where the Neovim config is kept.
+$RepoRoot = Split-Path -Parent $PSScriptRoot
 
 # Edit this list, commit, and either rebuild the VM or re-run this script.
 $Packages = @(
@@ -37,11 +53,14 @@ $Packages = @(
     'python313'
     'gh'
     'make'
+    'lazygit'      # LazyVim's git UI, bound to <leader>gg
+    'mingw'        # gcc, so nvim-treesitter can compile its parsers
 )
 
-# Globally installed npm CLIs. The coding agent lives here.
+# Globally installed npm CLIs. The coding agents live here.
 $NpmGlobals = @(
     '@anthropic-ai/claude-code'
+    '@openai/codex'
 )
 
 function Step {
@@ -80,8 +99,8 @@ Step 'defender-exclusions' {
     $exclude = @(
         $Workspace
         'C:\ProgramData\chocolatey'
-        "$env:USERPROFILE\.npm"
-        "$env:APPDATA\npm"
+        (Join-Path $UserHome '.npm')
+        (Join-Path $UserAppDataRoaming 'npm')
     )
     foreach ($path in $exclude) {
         Add-MpPreference -ExclusionPath $path -ErrorAction SilentlyContinue
@@ -109,7 +128,7 @@ Step 'machine-path' {
         'C:\Program Files\Git\cmd'
         'C:\Program Files\Git\usr\bin'
         'C:\Program Files\nodejs'
-        "$env:APPDATA\npm"
+        (Join-Path $UserAppDataRoaming 'npm')
     )
 
     $current = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -159,6 +178,52 @@ Step 'git-defaults' {
 }
 
 # ---------------------------------------------------------------------------
+Step 'neovim-config' {
+    # The LazyVim config lives in this repository and is linked into place,
+    # rather than cloned fresh from the starter. Your edits are then version
+    # controlled and follow you onto every machine you rebuild, which is the
+    # entire point of keeping this repo. lazy-lock.json lands in the repo too,
+    # so plugin versions are pinned across rebuilds.
+    $source = Join-Path $RepoRoot 'config\nvim'
+    $target = Join-Path $UserAppDataLocal 'nvim'
+
+    if (-not (Test-Path $source)) { throw "no Neovim config at $source" }
+    New-Item -ItemType Directory -Force -Path $UserAppDataLocal | Out-Null
+
+    $existing = Get-Item $target -Force -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($existing.LinkType -ne 'SymbolicLink') {
+            # Someone has a real config here. Deleting it would throw away work
+            # that was never committed anywhere.
+            throw "$target exists and is not a symlink, move it aside first"
+        }
+        if (($existing.Target | Select-Object -First 1) -eq $source) { return }
+        Remove-Item $target -Force
+    }
+
+    New-Item -ItemType SymbolicLink -Path $target -Target $source | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+if (-not $SkipPackages) {
+    Step 'neovim-plugins' {
+        # Pre-install so the first `nvim` is not a five minute download, and so
+        # a broken plugin set surfaces here rather than the first time you open
+        # a file over SSH.
+        $nvim = Get-Command nvim -ErrorAction SilentlyContinue
+        if (-not $nvim) { throw 'nvim not on PATH' }
+
+        $proc = Start-Process $nvim.Source -PassThru -NoNewWindow `
+            -ArgumentList '--headless', '+Lazy! sync', '+qa'
+
+        if (-not $proc.WaitForExit(600000)) {
+            $proc.Kill()
+            throw 'plugin sync did not finish within 10 minutes'
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 Step 'powershell-profile' {
     $profileDir = 'C:\Program Files\PowerShell\7'
     $profilePath = Join-Path $profileDir 'profile.ps1'
@@ -173,6 +238,10 @@ $env:CLAUDE_CODE_GIT_BASH_PATH = 'C:\Program Files\Git\bin\bash.exe'
 
 Set-Alias -Name ll -Value Get-ChildItem
 Set-Alias -Name g  -Value git
+Set-Alias -Name v  -Value nvim
+Set-Alias -Name lg -Value lazygit
+
+$env:EDITOR = 'nvim'
 
 function .. { Set-Location .. }
 
