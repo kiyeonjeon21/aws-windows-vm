@@ -178,10 +178,18 @@ function .. { Set-Location .. }
 
 # A terminal over a long SSH link is unusable with the default PSReadLine
 # prediction view, which redraws the whole line on every keystroke.
-if (Get-Module -ListAvailable PSReadLine) {
+#
+# The virtual terminal check is load bearing. `ssh host '<command>'` runs with
+# redirected output, where setting a prediction view throws, and a profile that
+# throws prints a wall of red on every single non-interactive invocation.
+if ($Host.UI.SupportsVirtualTerminal -and (Get-Module -ListAvailable PSReadLine)) {
     Import-Module PSReadLine
-    Set-PSReadLineOption -PredictionSource History -PredictionViewStyle InlineView
-    Set-PSReadLineOption -EditMode Windows
+    try {
+        Set-PSReadLineOption -PredictionSource History -PredictionViewStyle InlineView
+        Set-PSReadLineOption -EditMode Windows
+    } catch {
+        # An older PSReadLine without prediction support is not worth a warning.
+    }
 }
 
 function Get-IdleShutdownState {
