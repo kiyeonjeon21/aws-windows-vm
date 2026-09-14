@@ -217,9 +217,10 @@ Step 'neovim-config' {
 # ---------------------------------------------------------------------------
 if (-not $SkipPackages) {
     Step 'neovim-plugins' {
-        # Pre-install so the first `nvim` is not a five minute download, and so
-        # a broken plugin set surfaces here rather than the first time you open
-        # a file over SSH.
+        # Pre-install so the first `nvim` is not a long download, and so a
+        # broken plugin set surfaces here rather than the first time a file is
+        # opened over SSH.
+        #
         # Chocolatey's neovim package installs here and registers it on the
         # user PATH only, so do not assume PATH alone will find it.
         $nvim = (Get-Command nvim -ErrorAction SilentlyContinue).Source
@@ -229,13 +230,24 @@ if (-not $SkipPackages) {
         }
         if (-not $nvim) { throw 'cannot locate nvim.exe' }
 
-        $proc = Start-Process $nvim -PassThru -NoNewWindow `
-            -ArgumentList '--headless', '+Lazy! sync', '+qa'
-
-        if (-not $proc.WaitForExit(600000)) {
-            $proc.Kill()
-            throw 'plugin sync did not finish within 10 minutes'
+        function Invoke-Nvim([string[]] $NvimArgs, [int] $TimeoutMs) {
+            $proc = Start-Process $nvim -PassThru -NoNewWindow -ArgumentList $NvimArgs
+            if (-not $proc.WaitForExit($TimeoutMs)) {
+                $proc.Kill()
+                throw "nvim $($NvimArgs -join ' ') did not finish in time"
+            }
         }
+
+        Invoke-Nvim @('--headless', '+Lazy! sync', '+qa') 600000
+
+        # Lazy's sync is synchronous, but nvim-treesitter compiles its parsers
+        # on background jobs that only start once the plugin loads, which
+        # happens on a filetype event. Quitting straight after the sync kills
+        # those jobs mid-build and leaves the parser directory empty, with
+        # nothing in the output to say so. Open a real file and let them run.
+        $probe = Join-Path $env:TEMP 'lazyvim-warmup.lua'
+        Set-Content -Path $probe -Value 'return {}' -Encoding utf8
+        Invoke-Nvim @('--headless', $probe, '+sleep 150', '+qa') 600000
     }
 }
 
