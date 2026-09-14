@@ -14,7 +14,8 @@ resource "aws_instance" "this" {
   instance_initiated_shutdown_behavior = "stop"
 
   # First boot only. Editing the template afterwards does not re-run it; SSH in
-  # and run bootstrap/setup.ps1 by hand, or rebuild with `vm rebuild`.
+  # and run bootstrap/setup.ps1 by hand, or rebuild the instance with
+  # `terraform apply -replace=aws_instance.this`.
   user_data_replace_on_change = false
 
   user_data = templatefile("${path.module}/../bootstrap/userdata.ps1.tftpl", {
@@ -47,7 +48,8 @@ resource "aws_instance" "this" {
   lifecycle {
     # AWS publishes a new Windows AMI every month. Without this, an unrelated
     # apply would destroy the box and everything on its disk just because the
-    # SSM parameter moved. Rebuild deliberately with `vm rebuild` instead.
+    # SSM parameter moved. Move to a newer AMI deliberately instead, with
+    # `terraform apply -replace=aws_instance.this`.
     ignore_changes = [ami]
   }
 }

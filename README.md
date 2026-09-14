@@ -18,12 +18,17 @@ Four vCPU and 8 GiB of RAM, rebuilt from this repository in one command from any
 
 ## Cost
 
-On-demand `c6i.xlarge` in `us-east-1` is roughly USD 0.35 per hour with the Windows licence included, against roughly USD 0.17 for the same hardware running Linux.
-The licence is most of the difference.
+On-demand `c6i.xlarge` in `us-east-1`, from the AWS Pricing API:
 
-Left running continuously that is about USD 250 per month.
-At six hours a day on weekdays, which is what the idle watchdog is there to enforce, it is closer to USD 45 per month.
-Stopped, you pay only for the 100 GiB volume and the Elastic IP, about USD 12 per month.
+| | Per hour | Running 24/7 | Running 6h x 22d |
+|---|---|---|---|
+| Windows Server | USD 0.3540 | USD 258 / mo | USD 47 / mo |
+| Linux, same hardware | USD 0.1700 | USD 124 / mo | USD 22 / mo |
+
+The Windows licence is the whole of that difference, and it is charged per vCPU, so it scales with the instance rather than being a flat fee.
+
+Stopped, you pay only for storage: about USD 8 per month for the 100 GiB gp3 volume, plus USD 3.60 for the Elastic IP, which AWS now bills whether or not it is attached to a running instance.
+That floor of roughly USD 12 per month is the price of being able to stop the box and keep its disk.
 
 ## Prerequisites
 
@@ -40,6 +45,12 @@ cp terraform.tfvars.example terraform.tfvars
 $EDITOR terraform.tfvars          # public key, your address, repo URL
 terraform init
 terraform apply
+```
+
+If your credentials live in a named profile rather than the default one, export it first, and export the same value for the `vm` CLI later:
+
+```sh
+export AWS_PROFILE=your-profile
 ```
 
 First boot takes about ten minutes.
