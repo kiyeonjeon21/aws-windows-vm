@@ -257,6 +257,39 @@ if (-not $SkipPackages) {
 }
 
 # ---------------------------------------------------------------------------
+Step 'idle-watchdog-schedule' {
+    # The watchdog itself is written by user-data, because cost protection must
+    # not depend on this repository having been cloned. Its schedule is checked
+    # here as well, so a broken one can be repaired by re-running this script
+    # rather than only by rebuilding the instance.
+    #
+    # A scheduled task that has stopped recurring still reports State Ready and
+    # LastTaskResult 0. NextRunTime is the only field that tells the truth.
+    $script = 'C:\ProgramData\winvm\idle-shutdown.ps1'
+    if (-not (Test-Path $script)) {
+        Write-Host 'no watchdog script on this box, nothing to schedule'
+        return
+    }
+
+    $next = (Get-ScheduledTaskInfo -TaskName 'winvm-idle-shutdown' -ErrorAction SilentlyContinue).NextRunTime
+    if ($next) {
+        Write-Host "idle watchdog next run: $next"
+        return
+    }
+
+    Write-Host 'idle watchdog is not scheduled to run again, re-registering'
+    $cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script"
+    schtasks.exe /Create /TN 'winvm-idle-shutdown' /F /SC MINUTE /MO 5 `
+        /RU SYSTEM /RL HIGHEST /TR $cmd | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "schtasks exited with $LASTEXITCODE" }
+
+    Start-Sleep -Seconds 3
+    $next = (Get-ScheduledTaskInfo -TaskName 'winvm-idle-shutdown').NextRunTime
+    if (-not $next) { throw 'watchdog re-registered but still has no next run time' }
+    Write-Host "idle watchdog next run: $next"
+}
+
+# ---------------------------------------------------------------------------
 Step 'powershell-profile' {
     $profileDir = 'C:\Program Files\PowerShell\7'
     $profilePath = Join-Path $profileDir 'profile.ps1'

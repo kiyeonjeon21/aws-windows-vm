@@ -199,22 +199,24 @@ if ($idle -ge $IdleLimit) {
 
     Set-Content -Path "$Root\idle-shutdown.ps1" -Value $watchdog -Encoding utf8 -Force
 
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Root\idle-shutdown.ps1`""
+    # schtasks, not Register-ScheduledTask. Copying a repetition onto a boot
+    # trigger registers without complaint, fires two or three times, and then
+    # stops: the repetition carries no duration, nothing rejects that, and the
+    # task sits at state Ready with LastTaskResult 0 and an empty NextRunTime
+    # forever after. It looks healthy from every angle. A box was left running
+    # unattended for 37 hours by exactly this. /SC MINUTE recurs properly.
+    $cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Root\idle-shutdown.ps1"
 
-    # An at-startup trigger carrying a repetition interval is the only shape
-    # that both survives a reboot and keeps firing every five minutes.
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+    schtasks.exe /Create /TN 'winvm-idle-shutdown' /F /SC MINUTE /MO 5 `
+        /RU SYSTEM /RL HIGHEST /TR $cmd | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "schtasks exited with $LASTEXITCODE" }
 
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
-        -LogonType ServiceAccount -RunLevel Highest
-
-    Register-ScheduledTask -TaskName 'winvm-idle-shutdown' -Action $action `
-        -Trigger $trigger -Principal $principal -Force | Out-Null
-
-    Start-ScheduledTask -TaskName 'winvm-idle-shutdown'
+    # Registering a task is not the same as it being scheduled to run again,
+    # which is the whole substance of the bug above. Prove it will fire.
+    Start-Sleep -Seconds 3
+    $next = (Get-ScheduledTaskInfo -TaskName 'winvm-idle-shutdown').NextRunTime
+    if (-not $next) { throw 'idle watchdog registered but has no next run time' }
+    Write-Host "idle watchdog next run: $next"
 }
 
 # --------------------------------------------------------------------------

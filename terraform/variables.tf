@@ -99,3 +99,15 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "idle_backstop_hours" {
+  description = "Stop the instance after this many hours of low CPU, regardless of what the in-guest watchdog is doing. This is a backstop for the watchdog failing silently, not the normal mechanism, so keep it well above idle_shutdown_minutes. Set to 0 to disable."
+  type        = number
+  default     = 2
+}
+
+variable "idle_backstop_cpu_threshold" {
+  description = "CPU percentage below which the backstop alarm counts a period as idle."
+  type        = number
+  default     = 5
+}
