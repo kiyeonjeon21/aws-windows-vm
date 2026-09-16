@@ -111,3 +111,15 @@ variable "idle_backstop_cpu_threshold" {
   type        = number
   default     = 5
 }
+
+variable "budget_alert_email" {
+  description = "Address to email when account spend crosses the thresholds below. Empty disables the budget entirely."
+  type        = string
+  default     = ""
+}
+
+variable "budget_monthly_limit" {
+  description = "Monthly account spend in USD that the alerts are measured against."
+  type        = number
+  default     = 50
+}
